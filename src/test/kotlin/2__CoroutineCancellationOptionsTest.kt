@@ -1,6 +1,8 @@
 import kotlinx.coroutines.*
 import mu.KotlinLogging
 import org.amshove.kluent.shouldBeEqualTo
+import org.amshove.kluent.shouldBeGreaterThan
+import kotlin.system.measureTimeMillis
 import kotlin.test.Test
 
 private val logger = KotlinLogging.logger {}
@@ -21,6 +23,7 @@ class CoroutineCancellationOptionsTest {
             // child job that cancels it's sibling. Also parent can cancel child jobs
             val job2 = launch {
                 delay(100)
+                // cancel sibling job. Calling cancel is considered normal cancellation and is not cancelling parent
                 job1.cancel()
                 delay(500)
                 logger.info { "Done with job 2" }
@@ -39,7 +42,7 @@ class CoroutineCancellationOptionsTest {
     }
 
     @Test
-    fun `child coroutine timeout is not affecting siblings nor parent`() = runBlocking {
+    fun `child coroutine timeout is cancelling siblings and parent coroutine but not whole scope`() = runBlocking {
         val scope = CoroutineScope(Job())
         // root-level coroutine
         val job = scope.launch {
@@ -50,6 +53,7 @@ class CoroutineCancellationOptionsTest {
             }
 
             // child job that times out also cancels siblings and parent, but not whole scope
+            // this is called exceptional cancellation
             val job2 = withTimeout(200) {
                 launch {
                     delay(500)
@@ -71,7 +75,7 @@ class CoroutineCancellationOptionsTest {
 
     @Test
     fun `uncaught exception in launch is cancelling siblings, parent and whole scope`(): Unit = runBlocking {
-        var rootLevelException = ExceptionRetriever()
+        val rootLevelException = ExceptionRetriever()
         val scope = CoroutineScope(Job())
         val job = scope.launch(rootLevelException.handler()) {
             // long running job
@@ -149,7 +153,7 @@ class CoroutineCancellationOptionsTest {
     @Test
     fun `async that throws exception and is not awaited cancels parent coroutine and whole scope`(): Unit =
         runBlocking {
-            var rootLevelException = ExceptionRetriever()
+            val rootLevelException = ExceptionRetriever()
             val scope = CoroutineScope(Job())
             val job = scope.launch(rootLevelException.handler()) {
                 async {
@@ -168,4 +172,42 @@ class CoroutineCancellationOptionsTest {
             // exception was propagated to root-level coroutine because of missing await
             rootLevelException.caughtException!!.message shouldBeEqualTo "exception from nested async"
         }
+
+    @Test
+    fun `child cancellation is cooperative`(): Unit = runBlocking {
+        val scope = CoroutineScope(Job())
+        lateinit var job: Job
+        lateinit var childJob: Job
+        val executionTime = measureTimeMillis {
+            // root-level coroutine
+            job = scope.launch {
+                // long running job
+                childJob = launch {
+                    // long running task that does not support cancellation will run till the end
+                    launch {
+                        Thread.sleep(2000)
+                    }
+                    delay(1000)
+                    logger.info { "Done with job 1" }
+                }
+                delay(500)
+                // cancel coroutine and its child
+                childJob.cancel()
+            }
+            job.join()
+        }
+
+
+        // root job completed normally
+        job.isCompleted shouldBeEqualTo true
+        job.isCancelled shouldBeEqualTo false
+
+        // child job was cancelled
+        childJob.isCompleted shouldBeEqualTo true
+        childJob.isCancelled shouldBeEqualTo true
+        scope.isActive shouldBeEqualTo true
+
+        // but it took 2000ms because child didn't support cancellation
+        executionTime shouldBeGreaterThan 2000
+    }
 }
